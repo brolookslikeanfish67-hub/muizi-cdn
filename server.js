@@ -773,8 +773,6 @@ app.delete(
                 UPLOAD_DIR
             );
 
-        // Prevent path traversal.
-
         if (
             !resolved.startsWith(
                 uploadRoot +
@@ -1010,8 +1008,6 @@ setTimeout(() => {
     );
 }, 10000);
 
-// Then periodically.
-
 setInterval(
     () => {
         runRetentionCleanup().catch(
@@ -1228,11 +1224,11 @@ app.listen(
         );
 
         console.log(
-            `[CONFIG] Retention: ${
-                RETENTION_ENABLED
-                    ? `enabled (${RETENTION_DAYS} days)`
-                    : "disabled"
-            }`
+            `[CONFIG] Default retention: ${RETENTION_DAYS} days`
+        );
+
+        console.log(
+            `[CONFIG] Retention check interval: ${RETENTION_CHECK_INTERVAL_HOURS} hour(s)`
         );
 
         console.log(
