@@ -174,27 +174,6 @@ function requireOwner(req, res) {
     return key;
 }
 
-function getRetentionDays(req) {
-    const header = req.headers["x-retention-days"];
-
-    if (header === undefined) {
-        return null;
-    }
-
-    const days = Number(header);
-
-    if (
-        !Number.isInteger(days) ||
-        days < 1
-    ) {
-        throw new Error(
-            "X-Retention-Days must be a positive whole number"
-        );
-    }
-
-    return days;
-}
-
 function id() {
     return crypto.randomUUID();
 }
