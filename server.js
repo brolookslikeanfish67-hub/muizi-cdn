@@ -18,8 +18,6 @@ const PORT = process.env.PORT || 3010;
 const BASE_URL = process.env.BASE_URL;
 const OWNER_KEY = process.env.OWNER_API_KEY;
 
-const RETENTION_ENABLED =
-    String(process.env.RETENTION_ENABLED).toLowerCase() === "true";
 
 const RETENTION_DAYS = Math.max(
     1,
@@ -180,6 +178,27 @@ function requireOwner(req, res) {
     }
 
     return key;
+}
+
+function getRetentionDays(req) {
+    const header = req.headers["x-retention-days"];
+
+    if (header === undefined) {
+        return null;
+    }
+
+    const days = Number(header);
+
+    if (
+        !Number.isInteger(days) ||
+        days < 1
+    ) {
+        throw new Error(
+            "X-Retention-Days must be a positive whole number"
+        );
+    }
+
+    return days;
 }
 
 function id() {
@@ -654,8 +673,7 @@ app.post("/upload", (req, res) => {
                             );
                         }
 
-                        // Determine the retention
-                        // settings for this file.
+                        
 
                         let retentionOverride =
                             null;
@@ -903,109 +921,48 @@ app.post(
 );
 
 async function runRetentionCleanup() {
-    if (!RETENTION_ENABLED) {
-        console.log(
-            "[RETENTION] Disabled. Skipping cleanup."
-        );
-
-        return;
-    }
-
-    console.log(
-        `[RETENTION] Running cleanup. Global retention: ${RETENTION_DAYS} days`
-    );
+    console.log("[RETENTION] Running cleanup.");
 
     const now = Date.now();
 
-    const globalCutoff =
-        now -
-        RETENTION_DAYS *
-            24 *
-            60 *
-            60 *
-            1000;
-
-    const files =
-        db.prepare(`
-            SELECT
-                id,
-                originalName,
-                uploadedAt,
-                retentionOverride,
-                retentionDays
-            FROM files
-        `).all();
+    const files = db.prepare(`
+        SELECT
+            id,
+            originalName,
+            uploadedAt,
+            retentionDays
+        FROM files
+        WHERE retentionDays IS NOT NULL
+    `).all();
 
     let deleted = 0;
     let skipped = 0;
 
     for (const file of files) {
-        let shouldDelete = false;
+        const expirationTime =
+            file.uploadedAt +
+            file.retentionDays *
+                24 *
+                60 *
+                60 *
+                1000;
 
-        
-
-        if (
-            file.retentionOverride ===
-            1
-        ) {
-            if (
-                file.retentionDays &&
-                file.uploadedAt <=
-                    now -
-                        file.retentionDays *
-                            24 *
-                            60 *
-                            60 *
-                            1000
-            ) {
-                shouldDelete =
-                    true;
-            }
-        }
-
-        
-
-        else if (
-            file.retentionOverride ===
-            0
-        ) {
-            shouldDelete =
-                false;
-        }
-
-        
-
-        else if (
-            file.uploadedAt <=
-            globalCutoff
-        ) {
-            shouldDelete =
-                true;
-        }
-
-        if (!shouldDelete) {
+        if (now < expirationTime) {
             skipped++;
             continue;
         }
 
         try {
             const matchingFiles =
-                await fsp.readdir(
-                    UPLOAD_DIR
-                );
+                await fsp.readdir(UPLOAD_DIR);
 
             const filesToDelete =
                 matchingFiles.filter(
                     filename =>
-                        path.parse(
-                            filename
-                        ).name ===
-                        file.id
+                        path.parse(filename).name === file.id
                 );
 
-            for (
-                const filename of filesToDelete
-            ) {
+            for (const filename of filesToDelete) {
                 try {
                     await fsp.unlink(
                         path.join(
@@ -1013,14 +970,9 @@ async function runRetentionCleanup() {
                             filename
                         )
                     );
-                } catch (
-                    unlinkError
-                ) {
-                    if (
-                        unlinkError.code !==
-                        "ENOENT"
-                    ) {
-                        throw unlinkError;
+                } catch (err) {
+                    if (err.code !== "ENOENT") {
+                        throw err;
                     }
                 }
             }
@@ -1034,6 +986,7 @@ async function runRetentionCleanup() {
             console.log(
                 `[RETENTION] Deleted ${file.id} (${file.originalName})`
             );
+
         } catch (err) {
             console.error(
                 `[RETENTION] Failed to delete ${file.id}:`,
