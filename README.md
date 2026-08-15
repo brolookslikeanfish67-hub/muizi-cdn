@@ -31,11 +31,19 @@ Configure your .env.
 PORT=3000
 BASE_URL=https://cdn.example.com
 OWNER_API_KEY=randomgenkey
+RETENTION_ENABLED=false
+RETENTION_DAYS=30
+RETENTION_CHECK_INTERVAL_HOURS=1
+MAX_UPLOAD_SIZE_GB=25
 ```
 Details:
 - `PORT=3000` should be left as **3000** unless the port is being used by another process.
 - `BASE_URL=https://cdn.example.com` should be set as your URL. (exm: https://cdn.yourdomain.com)
 - `OWNER_API_KEY=randomgenkey` should be set to a random generated set of characters. This is the key you will give the CDN when uploading.
+- `RETENTION_ENABLED=false` has 2 toggles, true/false. If this is set to true, files will be retained and will not be deleted. If this is set to false, files will expire and delete after a specified amount of time.
+- `RETENTION_DAYS=30` is the amount of days a file will be retained for. Example: if I set it to 14, it will be retained for 2 weeks (14 days).
+- `RETENTION_CHECK_INTERVAL_HOURS=1` is how often the cdn will check for expired files. Example: if I set it to 6, it will check every 6 hours for expired files.
+- `MAX_UPLOAD_SIZE_GB=25` is the maximum upload size. Example: if I set it to 2, if I try and upload a 3 GB file, the cdn will deny it.
 
 ## Step 3:
 Start the CDN.
@@ -74,3 +82,4 @@ mkdir uploads temp
 - This project is recommended for personal projects, it has not been tested for production projects (bigger projects).
 - This project is still in beta, **may not** be fully optimized.
 - This project allows images, videos and gifs to be displayed in discord.
+- This project has 2 health endpoints, `/health` and `/health/ready`, use these for status pages like Uptime Kuma.
