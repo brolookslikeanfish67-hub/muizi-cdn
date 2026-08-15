@@ -54,7 +54,7 @@ In any text editor, open up the file. Open the find tool and paste in:
 ```bash
 https://cdn.example.com
 ```
-Replace those 2 URLs in the file with the url you put in `BASE_URL`.
+Replace the URL(s) in the file with the url you put in `BASE_URL`.
 
 ## Step 5:
 To start serving `example-upload.html`, use,
@@ -66,6 +66,8 @@ Once npx is served, open the localhost and find the `example-upload.html` file.
 Click on it to open it, Put in your api key, choose a file to upload, then click upload. 
 
 This will confirm if **your** CDN is working correctly.
+
+**Note:** Sometimes when you are trying to use `example-upload.html` with `npx serve` it will fail. You may need to deploy the html file using vercel or a similar hosting service.
 
 ## Notes:
 - The CDN should automatically create the required folders, if the CDN fails to create them, run these commands:
