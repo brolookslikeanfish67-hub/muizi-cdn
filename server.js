@@ -18,12 +18,6 @@ const PORT = process.env.PORT || 3010;
 const BASE_URL = process.env.BASE_URL;
 const OWNER_KEY = process.env.OWNER_API_KEY;
 
-
-const RETENTION_DAYS = Math.max(
-    1,
-    Number(process.env.RETENTION_DAYS) || 30
-);
-
 const RETENTION_CHECK_INTERVAL_HOURS = Math.max(
     1,
     Number(process.env.RETENTION_CHECK_INTERVAL_HOURS) || 1
@@ -206,47 +200,34 @@ function id() {
 }
 
 function getRetentionHeaders(req) {
-    const enabledHeader =
-        req.headers["x-retention-enabled"];
-
     const daysHeader =
         req.headers["x-retention-days"];
 
-    const hasOverride =
-        enabledHeader !== undefined ||
-        daysHeader !== undefined;
-
-    if (!hasOverride) {
+    if (
+        daysHeader === undefined ||
+        daysHeader === ""
+    ) {
         return {
-            override: false
+            override: true,
+            enabled: false,
+            days: null
         };
     }
 
-    const enabled =
-        String(enabledHeader).toLowerCase() === "true";
+    const days = Number(daysHeader);
 
-    let days = null;
-
-    if (daysHeader !== undefined) {
-        days = Number(daysHeader);
-
-        if (
-            !Number.isInteger(days) ||
-            days < 1
-        ) {
-            throw new Error(
-                "X-Retention-Days must be a positive whole number"
-            );
-        }
-    }
-
-    if (enabled && !days) {
-        days = RETENTION_DAYS;
+    if (
+        !Number.isInteger(days) ||
+        days < 1
+    ) {
+        throw new Error(
+            "X-Retention-Days must be a positive whole number"
+        );
     }
 
     return {
         override: true,
-        enabled,
+        enabled: true,
         days
     };
 }
@@ -691,8 +672,7 @@ app.post("/upload", (req, res) => {
 
                             retentionDays =
                                 retention.enabled
-                                    ? retention.days ||
-                                      RETENTION_DAYS
+                                    ? retention.days
                                     : null;
                         }
 
