@@ -73,9 +73,6 @@
 ></progress>
 <script>
 const CDN_URL = "https://cdn.example.com";
-// =====================================================
-// Upload
-// =====================================================
 async function upload() {
     const file =
         document.getElementById("file")
@@ -104,7 +101,6 @@ async function upload() {
         "Authorization",
         "Bearer " + apiKey
     );
-    // Retention settings
     if (retentionMode === "enabled") {
         const days =
             Number(
@@ -211,9 +207,6 @@ async function upload() {
     };
     xhr.send(form);
 }
-// =====================================================
-// Delete
-// =====================================================
 async function deleteFile() {
     const apiKey =
         document.getElementById("apikey")
@@ -268,9 +261,6 @@ async function deleteFile() {
             "❌ Network error while deleting";
     }
 }
-// =====================================================
-// Change Existing File Retention
-// =====================================================
 async function changeRetention() {
     const apiKey =
         document.getElementById("apikey")
@@ -363,9 +353,6 @@ async function changeRetention() {
             "❌ Network error while updating retention";
     }
 }
-// =====================================================
-// Health
-// =====================================================
 async function checkHealth() {
     const output =
         document.getElementById(
@@ -395,9 +382,6 @@ async function checkHealth() {
             "❌ CDN unreachable";
     }
 }
-// =====================================================
-// Readiness
-// =====================================================
 async function checkReady() {
     const output =
         document.getElementById(
@@ -430,9 +414,6 @@ async function checkReady() {
             "❌ CDN unreachable";
     }
 }
-// =====================================================
-// Uptime formatting
-// =====================================================
 function formatUptime(seconds) {
     seconds =
         Math.floor(seconds);
