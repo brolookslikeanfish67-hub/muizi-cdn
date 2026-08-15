@@ -1204,10 +1204,6 @@ app.listen(
         );
 
         console.log(
-            `[CONFIG] Default retention: ${RETENTION_DAYS} days`
-        );
-
-        console.log(
             `[CONFIG] Retention check interval: ${RETENTION_CHECK_INTERVAL_HOURS} hour(s)`
         );
 
