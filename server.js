@@ -14,13 +14,15 @@ const Database = require("better-sqlite3");
 const envalid = require("envalid");
 const pLimit = require("p-limit");
 
-// ---------- Environment Validation ----------
+// ---------- Environment ----------
 const env = envalid.cleanEnv(process.env, {
   PORT: envalid.port({ default: 3010 }),
-  BASE_URL: envalid.str({ desc: "Base URL for file links" }),
+  BASE_URL: envalid.str({ desc: "Public base URL for file links (no trailing slash)" }),
   OWNER_API_KEY: envalid.str({ desc: "Owner key for admin endpoints" }),
   RETENTION_CHECK_INTERVAL_HOURS: envalid.num({ default: 1, min: 1 }),
   MAX_UPLOAD_SIZE_GB: envalid.num({ default: 25, min: 1 }),
+  FFMPEG_CONCURRENCY: envalid.num({ default: 1, min: 1 }),
+  FFMPEG_TIMEOUT_MS: envalid.num({ default: 300_000, min: 30_000 }),
 });
 
 const {
@@ -29,56 +31,65 @@ const {
   OWNER_API_KEY,
   RETENTION_CHECK_INTERVAL_HOURS,
   MAX_UPLOAD_SIZE_GB,
+  FFMPEG_CONCURRENCY,
+  FFMPEG_TIMEOUT_MS,
 } = env;
 
 const MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_GB * 1024 * 1024 * 1024;
 const UPLOAD_DIR = path.join(__dirname, "uploads");
 const TEMP_DIR = path.join(__dirname, "temp");
 const KEYS_FILE = path.join(__dirname, "keys.json");
+const DB_PATH = path.join(__dirname, "cdn.db");
 
-// ---------- Directories & Keys ----------
+// ---------- Directories ----------
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 fs.mkdirSync(TEMP_DIR, { recursive: true });
+
 if (!fs.existsSync(KEYS_FILE)) {
   fs.writeFileSync(KEYS_FILE, JSON.stringify({ keys: [] }, null, 2));
 }
 
 // ---------- Database ----------
-const db = new Database(path.join(__dirname, "cdn.db"));
+const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
+db.pragma("foreign_keys = ON");
 
-// Simple migration: add tables and indexes
 const userVersion = db.pragma("user_version", { simple: true });
 if (userVersion === 0) {
   db.exec(`
     CREATE TABLE files (
       id TEXT PRIMARY KEY,
-      originalName TEXT,
-      size INTEGER,
+      originalName TEXT NOT NULL,
+      size INTEGER NOT NULL,
       mime TEXT,
-      uploadedAt INTEGER,
-      retentionOverride INTEGER DEFAULT NULL,
+      uploadedAt INTEGER NOT NULL,
+      retentionOverride INTEGER DEFAULT NULL, -- 1 = force retention, 0 = force no retention, NULL = default
       retentionDays INTEGER DEFAULT NULL
     );
-    CREATE INDEX idx_retention ON files(uploadedAt, retentionDays);
+    CREATE INDEX idx_retention ON files(retentionDays, uploadedAt);
   `);
   db.pragma("user_version = 1");
 }
 
-// ---------- Logger (simple) ----------
+// ---------- Logger ----------
 const log = {
   info: (...args) => console.log(`[${new Date().toISOString()}] INFO:`, ...args),
+  warn: (...args) => console.warn(`[${new Date().toISOString()}] WARN:`, ...args),
   error: (...args) => console.error(`[${new Date().toISOString()}] ERROR:`, ...args),
 };
 
-// ---------- FFmpeg Queue with Concurrency & Timeout ----------
-const ffmpegLimit = pLimit(1); // only one conversion at a time
+// ---------- FFmpeg helpers ----------
+const ffmpegLimit = pLimit(FFMPEG_CONCURRENCY);
 
-async function runFFmpeg(args, timeoutMs = 300000) {
+function runFFmpeg(args, timeoutMs = FFMPEG_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
-    const proc = spawn(ffmpegPath, args);
+    const proc = spawn(ffmpegPath, args, { stdio: ["ignore", "ignore", "pipe"] });
     let stderr = "";
-    proc.stderr.on("data", (d) => (stderr += d.toString()));
+
+    proc.stderr.on("data", (d) => {
+      stderr += d.toString();
+      if (stderr.length > 64 * 1024) stderr = stderr.slice(-32 * 1024); // keep last 32 KB
+    });
 
     const timer = setTimeout(() => {
       proc.kill("SIGKILL");
@@ -88,25 +99,28 @@ async function runFFmpeg(args, timeoutMs = 300000) {
     proc.on("close", (code) => {
       clearTimeout(timer);
       if (code === 0) resolve();
-      else reject(new Error(stderr || `FFmpeg exited with code ${code}`));
+      else reject(new Error(stderr.trim() || `FFmpeg exited with code ${code}`));
     });
-    proc.on("error", reject);
+
+    proc.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
   });
 }
 
 async function convertVideoToMp4(input, output) {
   const tempOut = output + ".tmp.mp4";
   try {
-    // Try stream copy first
+    // Fast path: stream copy
     await runFFmpeg([
       "-y", "-i", input,
       "-c", "copy",
       "-movflags", "+faststart",
       tempOut,
     ]);
-    await fsp.rename(tempOut, output);
-  } catch (err) {
-    // Fallback to re-encode
+  } catch {
+    // Fallback: re-encode
     await runFFmpeg([
       "-y", "-i", input,
       "-c:v", "libx264", "-preset", "medium", "-crf", "20",
@@ -114,8 +128,8 @@ async function convertVideoToMp4(input, output) {
       "-movflags", "+faststart",
       tempOut,
     ]);
-    await fsp.rename(tempOut, output);
   }
+  await fsp.rename(tempOut, output);
 }
 
 async function convertAudioToMp3(input, output) {
@@ -126,30 +140,7 @@ async function convertAudioToMp3(input, output) {
   ]);
 }
 
-// ---------- Express App ----------
-const app = express();
-
-// Middleware
-app.use(helmet({ crossOriginResourcePolicy: false }));
-app.use(compression());
-
-app.use(express.json({ limit: "50mb" }));
-app.use(express.urlencoded({ extended: true, limit: "50mb" }));
-
-// CORS
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, Range, X-Retention-Enabled, X-Retention-Days"
-  );
-  res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
-
-// ---------- Helper Functions ----------
+// ---------- Auth helpers ----------
 function generateId() {
   return crypto.randomUUID();
 }
@@ -157,24 +148,24 @@ function generateId() {
 function getToken(req) {
   const auth = req.headers.authorization;
   if (!auth) return null;
-  return auth.replace(/^Bearer\s+/i, "");
+  return auth.replace(/^Bearer\s+/i, "").trim() || null;
 }
 
 function getKeyData(token) {
-  if (token && token === OWNER_API_KEY) {
-    return { owner: true };
-  }
+  if (!token) return null;
+  if (token === OWNER_API_KEY) return { owner: true, key: token };
+
   try {
-    const keys = JSON.parse(fs.readFileSync(KEYS_FILE, "utf8"));
-    return keys.keys.find((k) => k.key === token) || null;
+    const data = JSON.parse(fs.readFileSync(KEYS_FILE, "utf8"));
+    const found = data.keys?.find((k) => k.key === token);
+    return found ? { ...found, owner: false } : null;
   } catch {
     return null;
   }
 }
 
 function authenticate(req, res, next) {
-  const token = getToken(req);
-  const key = getKeyData(token);
+  const key = getKeyData(getToken(req));
   if (!key) {
     return res.status(401).json({ error: "unauthorized" });
   }
@@ -183,18 +174,20 @@ function authenticate(req, res, next) {
 }
 
 function requireOwner(req, res, next) {
-  if (!req.key || !req.key.owner) {
+  if (!req.key?.owner) {
     return res.status(403).json({ error: "owner authorization required" });
   }
   next();
 }
 
 function parseRetentionHeaders(req) {
-  const daysHeader = req.headers["x-retention-days"];
-  if (daysHeader === undefined || daysHeader === "") {
-    return { override: true, enabled: false, days: null };
+  const raw = req.headers["x-retention-days"];
+  if (raw === undefined || raw === "") {
+    // No override → use default (no forced retention)
+    return { override: false, enabled: false, days: null };
   }
-  const days = Number(daysHeader);
+
+  const days = Number(raw);
   if (!Number.isInteger(days) || days < 1) {
     throw new Error("X-Retention-Days must be a positive whole number");
   }
@@ -202,14 +195,54 @@ function parseRetentionHeaders(req) {
 }
 
 function isSafePath(requestedPath) {
-  const relative = path.relative(UPLOAD_DIR, requestedPath);
-  return relative && !relative.startsWith("..") && !path.isAbsolute(relative);
+  const resolved = path.resolve(requestedPath);
+  const base = path.resolve(UPLOAD_DIR);
+  return resolved === base || resolved.startsWith(base + path.sep);
 }
 
+// ---------- MIME map ----------
+const MIME_MAP = {
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".png": "image/png",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".mp4": "video/mp4",
+  ".webm": "video/webm",
+  ".mp3": "audio/mpeg",
+  ".wav": "audio/wav",
+  ".pdf": "application/pdf",
+};
+
+const VIDEO_EXTS = new Set([".mov", ".mkv", ".avi", ".wmv"]);
+const AUDIO_EXTS = new Set([".wav", ".aac", ".m4a", ".flac", ".ogg", ".wma"]);
+
+// ---------- Express app ----------
+const app = express();
+
+app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
+app.use(compression());
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: true, limit: "1mb" }));
+
+// CORS
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, Range, X-Retention-Days"
+  );
+  res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
 // ---------- Routes ----------
+
 // Health
 app.get("/health", (req, res) => {
-  res.status(200).json({
+  res.json({
     status: "ok",
     uptime: process.uptime(),
     timestamp: Date.now(),
@@ -220,14 +253,14 @@ app.get("/health/ready", async (req, res, next) => {
   try {
     db.prepare("SELECT 1").get();
     await fsp.access(UPLOAD_DIR, fs.constants.R_OK | fs.constants.W_OK);
-    res.status(200).json({ status: "ready", database: "ok", storage: "ok" });
+    res.json({ status: "ready", database: "ok", storage: "ok" });
   } catch (err) {
     next(err);
   }
 });
 
 // Upload
-app.post("/upload", authenticate, (req, res, next) => {
+app.post("/upload", authenticate, (req, res) => {
   let retention;
   try {
     retention = parseRetentionHeaders(req);
@@ -243,101 +276,124 @@ app.post("/upload", authenticate, (req, res, next) => {
     headers: req.headers,
     limits: {
       files: 1,
-      parts: 2,
+      parts: 5,
       fileSize: MAX_UPLOAD_SIZE_BYTES,
     },
   });
 
   let tempPath = null;
   let responded = false;
+  let bytesReceived = 0;
+  let originalName = null;
+  let mimeType = null;
 
-  const fail = (err) => {
+  const cleanup = async () => {
+    if (tempPath) {
+      await fsp.unlink(tempPath).catch(() => {});
+      tempPath = null;
+    }
+  };
+
+  const fail = async (status, message, err) => {
     if (responded) return;
     responded = true;
-    log.error("Upload error:", err);
-    if (tempPath) {
-      fsp.unlink(tempPath).catch(() => {});
-    }
-    res.status(500).json({ error: "upload failed" });
+    await cleanup();
+    if (err) log.error("Upload failed:", err);
+    res.status(status).json({ error: message });
   };
 
   busboy.on("file", (field, file, info) => {
-    const originalName = info.filename;
-    const mimeType = info.mimeType;
-    let bytesReceived = 0;
+    originalName = info.filename || "unnamed";
+    mimeType = info.mimeType || "application/octet-stream";
+
+    const ext = path.extname(originalName).toLowerCase() || "";
+    const baseId = generateId();
+    tempPath = path.join(TEMP_DIR, baseId + (ext || ".bin"));
+
+    const writeStream = fs.createWriteStream(tempPath);
 
     file.on("data", (chunk) => {
       bytesReceived += chunk.length;
     });
 
-    const ext = path.extname(originalName).toLowerCase();
-    const baseId = generateId();
-    tempPath = path.join(TEMP_DIR, baseId + ext);
-    const writeStream = fs.createWriteStream(tempPath);
+    file.on("limit", () => {
+      file.resume(); // drain
+      fail(413, `File exceeds maximum size of ${MAX_UPLOAD_SIZE_GB} GB`);
+    });
 
     file.pipe(writeStream);
 
     writeStream.on("finish", async () => {
+      if (responded) return;
+
       try {
-        const videoExts = [".mov", ".mkv"];
-        const audioExts = [".wav", ".aac", ".m4a", ".flac", ".ogg", ".wma"];
         let finalExt = ext;
-        if (videoExts.includes(ext)) finalExt = ".mp4";
-        else if (audioExts.includes(ext)) finalExt = ".mp3";
+        if (VIDEO_EXTS.has(ext)) finalExt = ".mp4";
+        else if (AUDIO_EXTS.has(ext)) finalExt = ".mp3";
 
         const finalPath = path.join(UPLOAD_DIR, baseId + finalExt);
 
-        // Convert with concurrency limit
-        if (videoExts.includes(ext)) {
+        if (VIDEO_EXTS.has(ext)) {
           await ffmpegLimit(() => convertVideoToMp4(tempPath, finalPath));
-        } else if (audioExts.includes(ext)) {
+        } else if (AUDIO_EXTS.has(ext)) {
           await ffmpegLimit(() => convertAudioToMp3(tempPath, finalPath));
         } else {
           await fsp.rename(tempPath, finalPath);
+          tempPath = null; // already moved
         }
 
-        // Clean up temp
-        if (tempPath) {
-          await fsp.unlink(tempPath).catch(() => {});
-          tempPath = null;
-        }
+        await cleanup(); // remove any leftover temp
 
-        // Save metadata
         const retentionOverride = retention.override ? (retention.enabled ? 1 : 0) : null;
         const retentionDays = retention.override && retention.enabled ? retention.days : null;
 
         db.prepare(`
           INSERT INTO files (id, originalName, size, mime, uploadedAt, retentionOverride, retentionDays)
           VALUES (?, ?, ?, ?, ?, ?, ?)
-        `).run(baseId, originalName, bytesReceived, mimeType, Date.now(), retentionOverride, retentionDays);
+        `).run(
+          baseId,
+          originalName,
+          bytesReceived,
+          mimeType,
+          Date.now(),
+          retentionOverride,
+          retentionDays
+        );
 
         if (!responded) {
           responded = true;
           res.json({
             success: true,
-            filename: baseId,
+            id: baseId,
+            filename: baseId + finalExt,
             url: `${BASE_URL}/${baseId}${finalExt}`,
+            size: bytesReceived,
+            originalName,
           });
         }
       } catch (err) {
-        fail(err);
+        await fail(500, "upload processing failed", err);
       }
     });
 
-    writeStream.on("error", fail);
-    file.on("error", fail);
+    writeStream.on("error", (err) => fail(500, "upload write failed", err));
+    file.on("error", (err) => fail(500, "upload stream error", err));
   });
 
-  busboy.on("error", fail);
+  busboy.on("error", (err) => fail(400, "invalid multipart data", err));
+  busboy.on("filesLimit", () => fail(400, "only one file allowed"));
+  busboy.on("partsLimit", () => fail(400, "too many parts"));
+
   req.pipe(busboy);
 });
 
 // Delete
 app.delete("/delete/:file", authenticate, async (req, res, next) => {
-  const filename = req.params.file;
+  const filename = path.basename(req.params.file); // prevent path tricks
   const filePath = path.join(UPLOAD_DIR, filename);
+
   if (!isSafePath(filePath)) {
-    return res.sendStatus(403);
+    return res.status(403).json({ error: "forbidden" });
   }
 
   try {
@@ -348,22 +404,24 @@ app.delete("/delete/:file", authenticate, async (req, res, next) => {
 
   try {
     await fsp.unlink(filePath);
-    db.prepare("DELETE FROM files WHERE id = ?").run(path.parse(filename).name);
-    res.json({ success: true, message: `File ${filename} deleted.` });
+    const id = path.parse(filename).name;
+    db.prepare("DELETE FROM files WHERE id = ?").run(id);
+    res.json({ success: true, message: `File ${filename} deleted` });
   } catch (err) {
     next(err);
   }
 });
 
 // Retention override (owner only)
-app.post("/retention/:file", authenticate, requireOwner, async (req, res, next) => {
+app.post("/retention/:file", authenticate, requireOwner, (req, res) => {
   const fileId = path.parse(req.params.file).name;
-  const file = db.prepare("SELECT * FROM files WHERE id = ?").get(fileId);
+  const file = db.prepare("SELECT id FROM files WHERE id = ?").get(fileId);
+
   if (!file) {
     return res.status(404).json({ error: "file not found" });
   }
 
-  const enabled = req.body.enabled;
+  const enabled = req.body?.enabled;
   if (typeof enabled !== "boolean") {
     return res.status(400).json({ error: "enabled must be true or false" });
   }
@@ -376,55 +434,56 @@ app.post("/retention/:file", authenticate, requireOwner, async (req, res, next) 
     }
   }
 
-  db.prepare(`UPDATE files SET retentionOverride = ?, retentionDays = ? WHERE id = ?`).run(
-    enabled ? 1 : 0,
-    days,
-    fileId
-  );
+  db.prepare(
+    `UPDATE files SET retentionOverride = ?, retentionDays = ? WHERE id = ?`
+  ).run(enabled ? 1 : 0, days, fileId);
 
-  res.json({ success: true, file: fileId, retention: { enabled, days } });
+  res.json({
+    success: true,
+    file: fileId,
+    retention: { enabled, days },
+  });
 });
 
-// Serve files
+// Serve files (with Range support)
 app.get("/:file", async (req, res, next) => {
-  const filePath = path.join(UPLOAD_DIR, req.params.file);
+  const filename = path.basename(req.params.file);
+  const filePath = path.join(UPLOAD_DIR, filename);
+
   if (!isSafePath(filePath)) {
-    return res.sendStatus(403);
+    return res.status(403).end();
   }
 
   let stat;
   try {
     stat = await fsp.stat(filePath);
+    if (!stat.isFile()) return res.status(404).end();
   } catch {
-    return res.status(404).send("Not found");
+    return res.status(404).end();
   }
 
   const ext = path.extname(filePath).toLowerCase();
-  const mimeTypes = {
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".png": "image/png",
-    ".gif": "image/gif",
-    ".webp": "image/webp",
-    ".mp4": "video/mp4",
-    ".webm": "video/webm",
-    ".mp3": "audio/mpeg",
-  };
-  const mime = mimeTypes[ext] || "application/octet-stream";
+  const mime = MIME_MAP[ext] || "application/octet-stream";
 
   res.setHeader("Content-Type", mime);
   res.setHeader("Content-Disposition", "inline");
-  res.setHeader("Cache-Control", "public,max-age=31536000,immutable");
+  res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
   res.setHeader("Accept-Ranges", "bytes");
+  res.setHeader("X-Content-Type-Options", "nosniff");
 
   const range = req.headers.range;
   if (range) {
-    const parts = range.replace(/bytes=/, "").split("-");
-    const start = parseInt(parts[0], 10);
-    const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
-    if (isNaN(start) || isNaN(end) || start > end || end >= stat.size) {
+    const match = range.match(/bytes=(\d*)-(\d*)/);
+    if (!match) return res.status(416).end();
+
+    let start = match[1] ? parseInt(match[1], 10) : 0;
+    let end = match[2] ? parseInt(match[2], 10) : stat.size - 1;
+
+    if (isNaN(start) || isNaN(end) || start > end || start >= stat.size) {
       return res.status(416).end();
     }
+    end = Math.min(end, stat.size - 1);
+
     res.writeHead(206, {
       "Content-Range": `bytes ${start}-${end}/${stat.size}`,
       "Content-Length": end - start + 1,
@@ -436,28 +495,32 @@ app.get("/:file", async (req, res, next) => {
   }
 });
 
-// ---------- Error Handler ----------
+// ---------- Error handler ----------
 app.use((err, req, res, next) => {
   log.error("Unhandled error:", err);
-  res.status(err.status || 500).json({
-    error: err.message || "Internal server error",
+  const status = err.status || 500;
+  res.status(status).json({
+    error: status === 500 ? "Internal server error" : err.message,
   });
 });
 
-// ---------- Retention Cleanup ----------
+// ---------- Retention cleanup ----------
 async function runRetentionCleanup() {
-  log.info("Running retention cleanup");
+  log.info("Running retention cleanup…");
   const now = Date.now();
-  const files = db
+  const rows = db
     .prepare(
-      `SELECT id, originalName, uploadedAt, retentionDays FROM files WHERE retentionDays IS NOT NULL`
+      `SELECT id, originalName, uploadedAt, retentionDays
+       FROM files
+       WHERE retentionDays IS NOT NULL`
     )
     .all();
 
-  let deleted = 0,
-    skipped = 0;
-  for (const file of files) {
-    const expiry = file.uploadedAt + file.retentionDays * 24 * 60 * 60 * 1000;
+  let deleted = 0;
+  let skipped = 0;
+
+  for (const row of rows) {
+    const expiry = row.uploadedAt + row.retentionDays * 24 * 60 * 60 * 1000;
     if (now < expiry) {
       skipped++;
       continue;
@@ -465,40 +528,51 @@ async function runRetentionCleanup() {
 
     try {
       const entries = await fsp.readdir(UPLOAD_DIR);
-      const toDelete = entries.filter((f) => path.parse(f).name === file.id);
+      const toDelete = entries.filter((f) => path.parse(f).name === row.id);
+
       for (const f of toDelete) {
         await fsp.unlink(path.join(UPLOAD_DIR, f));
       }
-      db.prepare("DELETE FROM files WHERE id = ?").run(file.id);
+
+      db.prepare("DELETE FROM files WHERE id = ?").run(row.id);
       deleted++;
-      log.info(`Retention deleted ${file.id} (${file.originalName})`);
+      log.info(`Retention deleted ${row.id} (${row.originalName})`);
     } catch (err) {
-      log.error(`Failed to delete ${file.id}:`, err);
+      log.error(`Failed to delete ${row.id}:`, err);
     }
   }
-  log.info(`Cleanup complete. Deleted: ${deleted}, skipped: ${skipped}`);
+
+  log.info(`Cleanup finished. Deleted: ${deleted}, still valid: ${skipped}`);
 }
 
-// Schedule retention
-setTimeout(() => runRetentionCleanup().catch(log.error), 10000);
+// Schedule
+setTimeout(() => runRetentionCleanup().catch(log.error), 10_000);
 setInterval(
   () => runRetentionCleanup().catch(log.error),
-  RETENTION_CHECK_INTERVAL_HOURS * 3600000
+  RETENTION_CHECK_INTERVAL_HOURS * 3_600_000
 );
 
-// ---------- Start Server ----------
+// ---------- Start ----------
 const server = app.listen(PORT, () => {
-  log.info(`CDN running on port ${PORT}`);
-  log.info(`Max upload: ${MAX_UPLOAD_SIZE_GB} GB`);
-  log.info(`Retention interval: ${RETENTION_CHECK_INTERVAL_HOURS} hour(s)`);
+  log.info(`CDN listening on port ${PORT}`);
+  log.info(`Max upload size: ${MAX_UPLOAD_SIZE_GB} GB`);
+  log.info(`FFmpeg concurrency: ${FFMPEG_CONCURRENCY}`);
+  log.info(`Retention check every ${RETENTION_CHECK_INTERVAL_HOURS} h`);
 });
 
 // Graceful shutdown
-process.on("SIGTERM", () => {
-  log.info("SIGTERM received, shutting down");
-  server.close(() => process.exit(0));
-});
-process.on("SIGINT", () => {
-  log.info("SIGINT received, shutting down");
-  server.close(() => process.exit(0));
-});
+function shutdown(signal) {
+  log.info(`${signal} received – shutting down`);
+  server.close(() => {
+    try {
+      db.close();
+    } catch {}
+    process.exit(0);
+  });
+
+  // Force exit after 10 s
+  setTimeout(() => process.exit(1), 10_000).unref();
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
